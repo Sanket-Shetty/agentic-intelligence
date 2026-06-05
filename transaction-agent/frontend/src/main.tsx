@@ -1,6 +1,6 @@
 import React from "react"
 import ReactDOM from "react-dom/client"
-import { Activity, AlertTriangle, ArrowRight, Database, Gauge, RefreshCw, Search, Sparkles, Timer } from "lucide-react"
+import { Activity, AlertTriangle, ArrowRight, BarChart3, Database, Gauge, RefreshCw, Search, Sparkles, Timer } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
 import { SplineScene } from "@/components/ui/splite"
@@ -65,6 +65,18 @@ type PendingTransaction = {
   pending_mins?: number | string | null
 }
 
+type InsightResult = {
+  prompt: string
+  title: string
+  sql: string
+  chart_type: "bar" | "line" | "table" | "metric"
+  x_key?: string | null
+  y_key?: string | null
+  explanation: string
+  row_count: number
+  rows: Array<Record<string, unknown>>
+}
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 
 function formatValue(value: unknown) {
@@ -82,6 +94,10 @@ function App() {
   const [pendingTransactions, setPendingTransactions] = React.useState<PendingTransaction[]>([])
   const [pendingLoading, setPendingLoading] = React.useState(false)
   const [pendingError, setPendingError] = React.useState("")
+  const [insightPrompt, setInsightPrompt] = React.useState("")
+  const [insightResult, setInsightResult] = React.useState<InsightResult | null>(null)
+  const [insightLoading, setInsightLoading] = React.useState(false)
+  const [insightError, setInsightError] = React.useState("")
 
   const loadPendingTransactions = React.useCallback(async () => {
     setPendingLoading(true)
@@ -143,6 +159,30 @@ function App() {
     setInput(requestHash)
     setInputType("request_hash")
     await loadReport(requestHash, "request_hash")
+  }
+
+  async function handleInsightSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setInsightLoading(true)
+    setInsightError("")
+    setInsightResult(null)
+
+    try {
+      const response = await fetch(`${API_URL}/api/query-insights`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prompt: insightPrompt }),
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail ?? "Unable to generate insight")
+      }
+      setInsightResult(payload)
+    } catch (caught) {
+      setInsightError(caught instanceof Error ? caught.message : "Unexpected error")
+    } finally {
+      setInsightLoading(false)
+    }
   }
 
   return (
@@ -241,6 +281,15 @@ function App() {
           onRefresh={loadPendingTransactions}
           onSelect={handlePendingSelect}
           rows={pendingTransactions}
+        />
+
+        <InsightQueryPanel
+          error={insightError}
+          loading={insightLoading}
+          onPromptChange={setInsightPrompt}
+          onSubmit={handleInsightSubmit}
+          prompt={insightPrompt}
+          result={insightResult}
         />
       </section>
     </main>
@@ -465,6 +514,172 @@ function PendingTransactionsTable({
         </table>
       </div>
     </section>
+  )
+}
+
+function InsightQueryPanel({
+  error,
+  loading,
+  onPromptChange,
+  onSubmit,
+  prompt,
+  result,
+}: {
+  error: string
+  loading: boolean
+  onPromptChange: (value: string) => void
+  onSubmit: (event: React.FormEvent<HTMLFormElement>) => void
+  prompt: string
+  result: InsightResult | null
+}) {
+  return (
+    <section className="mt-8 rounded-lg border border-white/10 bg-white/[0.04]">
+      <div className="border-b border-white/10 p-4">
+        <div className="flex items-center gap-2">
+          <BarChart3 className="h-5 w-5 text-teal-200" />
+          <h2 className="text-xl font-semibold text-white">Ask transaction data</h2>
+        </div>
+        <p className="mt-1 text-sm text-slate-400">
+          Ask in plain English. The agent writes read-only SQL using successful transaction logic, quoteId joins, and chain names.
+        </p>
+      </div>
+
+      <form onSubmit={onSubmit} className="space-y-3 p-4">
+        <textarea
+          value={prompt}
+          onChange={(event) => onPromptChange(event.target.value)}
+          placeholder="Example: total volume done on Base chain as source chain in last 7 days"
+          className="min-h-24 w-full resize-y rounded-md border border-white/10 bg-slate-950 p-3 text-sm leading-6 text-white outline-none placeholder:text-slate-500 focus:border-teal-300/70"
+          required
+        />
+        <button
+          type="submit"
+          disabled={loading}
+          className="inline-flex h-10 items-center justify-center gap-2 rounded-md bg-teal-300 px-4 text-sm font-semibold text-slate-950 transition hover:bg-teal-200 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          {loading ? "Generating" : "Generate insight"}
+          <ArrowRight className="h-4 w-4" />
+        </button>
+      </form>
+
+      {error && (
+        <div className="mx-4 mb-4 flex items-start gap-3 rounded-md border border-red-400/30 bg-red-500/10 p-3 text-sm text-red-100">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      {result && <InsightResultView result={result} />}
+    </section>
+  )
+}
+
+function InsightResultView({ result }: { result: InsightResult }) {
+  return (
+    <div className="space-y-4 border-t border-white/10 p-4">
+      <div>
+        <h3 className="text-lg font-semibold text-white">{result.title}</h3>
+        <p className="mt-1 text-sm text-slate-400">
+          {result.explanation || `${result.row_count} rows returned`}
+        </p>
+      </div>
+
+      <InsightVisualization result={result} />
+
+      <details className="rounded-md border border-white/10 bg-slate-950/70">
+        <summary className="cursor-pointer px-4 py-3 text-sm font-medium text-slate-200">Generated SQL</summary>
+        <pre className="max-h-80 overflow-auto border-t border-white/10 p-4 text-xs leading-5 text-slate-300">
+          {result.sql}
+        </pre>
+      </details>
+
+      <InsightTable rows={result.rows} />
+    </div>
+  )
+}
+
+function InsightVisualization({ result }: { result: InsightResult }) {
+  if (result.row_count === 0) {
+    return (
+      <div className="rounded-md border border-white/10 bg-black/20 p-6 text-center text-sm text-slate-400">
+        No rows returned.
+      </div>
+    )
+  }
+
+  if (result.chart_type === "metric") {
+    const firstRow = result.rows[0] ?? {}
+    const key = result.y_key ?? Object.keys(firstRow).find((column) => Number.isFinite(Number(firstRow[column])))
+    return (
+      <div className="rounded-md border border-white/10 bg-black/20 p-6">
+        <div className="text-sm text-slate-400">{key ?? "Value"}</div>
+        <div className="mt-2 text-4xl font-semibold text-white">{formatNumber(key ? firstRow[key] : undefined, 2)}</div>
+      </div>
+    )
+  }
+
+  if ((result.chart_type === "bar" || result.chart_type === "line") && result.x_key && result.y_key) {
+    const values = result.rows
+      .map((row) => ({
+        label: formatValue(row[result.x_key as string]),
+        value: Number(row[result.y_key as string]),
+      }))
+      .filter((row) => Number.isFinite(row.value))
+      .slice(0, 12)
+    const maxValue = Math.max(...values.map((row) => row.value), 0)
+
+    return (
+      <div className="space-y-3 rounded-md border border-white/10 bg-black/20 p-4">
+        {values.length === 0 && <div className="text-sm text-slate-400">No numeric chart values found.</div>}
+        {values.map((row) => {
+          const width = maxValue > 0 ? Math.max((row.value / maxValue) * 100, 2) : 0
+          return (
+            <div key={`${row.label}-${row.value}`} className="grid grid-cols-[180px_1fr_120px] items-center gap-3 text-sm">
+              <div className="truncate text-slate-300" title={row.label}>{row.label}</div>
+              <div className="h-3 overflow-hidden rounded-full bg-white/10">
+                <div className="h-full rounded-full bg-teal-300" style={{ width: `${width}%` }} />
+              </div>
+              <div className="text-right font-medium text-white">{formatNumber(row.value, 2)}</div>
+            </div>
+          )
+        })}
+      </div>
+    )
+  }
+
+  return null
+}
+
+function InsightTable({ rows }: { rows: Array<Record<string, unknown>> }) {
+  const columns = Array.from(new Set(rows.flatMap((row) => Object.keys(row)))).slice(0, 16)
+
+  if (rows.length === 0 || columns.length === 0) {
+    return null
+  }
+
+  return (
+    <div className="overflow-x-auto rounded-md border border-white/10">
+      <table className="w-full min-w-[760px] border-collapse text-left text-sm">
+        <thead className="bg-black/25 text-xs uppercase text-slate-400">
+          <tr>
+            {columns.map((column) => (
+              <th key={column} className="px-3 py-2 font-medium">{column}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody className="divide-y divide-white/10">
+          {rows.slice(0, 100).map((row, index) => (
+            <tr key={index} className="text-slate-300">
+              {columns.map((column) => (
+                <td key={column} className="max-w-[260px] truncate px-3 py-2" title={formatValue(row[column])}>
+                  {formatValue(row[column])}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
   )
 }
 

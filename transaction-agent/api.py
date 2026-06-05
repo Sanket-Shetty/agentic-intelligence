@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from openai import OpenAI
 from pydantic import BaseModel, Field
 
+from agent.prompts import SQL_ANALYST_SYSTEM_PROMPT
 from tools.loki import LokiTool
-from tools.metabase import MetabaseTool
+from tools.metabase import MetabaseQueryError, MetabaseTool
 from tools.mixpanel import MixpanelTool
 from utils.parsers import chain_id_to_name, human_readable_amount, slippage_bps
 
@@ -31,6 +36,11 @@ class IntelligenceRequest(BaseModel):
     input_type: Literal["tx_hash", "request_hash", "auto"] = "auto"
     include_mixpanel: bool = True
     window_hours: int = Field(default=2, ge=1, le=48)
+
+
+class InsightQueryRequest(BaseModel):
+    prompt: str = Field(min_length=3, max_length=1000)
+    model: str = "gpt-4.1-mini"
 
 
 class SourceStatus(BaseModel):
@@ -92,6 +102,76 @@ def _build_summary(
     return " | ".join(parts)
 
 
+def _validate_read_only_sql(sql: str) -> str:
+    cleaned = sql.strip()
+    if cleaned.endswith(";"):
+        cleaned = cleaned[:-1].strip()
+
+    normalized = re.sub(r"/\*.*?\*/", " ", cleaned, flags=re.DOTALL)
+    normalized = re.sub(r"--.*?$", " ", normalized, flags=re.MULTILINE)
+    lowered = normalized.lower()
+
+    if not (lowered.startswith("select") or lowered.startswith("with")):
+        raise HTTPException(status_code=400, detail="Generated SQL must start with SELECT or WITH.")
+    if ";" in normalized:
+        raise HTTPException(status_code=400, detail="Generated SQL must contain exactly one statement.")
+
+    forbidden = {
+        "insert",
+        "update",
+        "delete",
+        "drop",
+        "alter",
+        "create",
+        "truncate",
+        "grant",
+        "revoke",
+        "copy",
+        "call",
+        "do",
+        "execute",
+    }
+    found = [word for word in forbidden if re.search(rf"\b{word}\b", lowered)]
+    if found:
+        raise HTTPException(status_code=400, detail=f"Generated SQL contains forbidden keyword: {found[0]}.")
+
+    return cleaned
+
+
+def _generate_insight_sql(prompt: str, model: str) -> dict[str, Any]:
+    if not os.getenv("OPENAI_API_KEY"):
+        raise HTTPException(
+            status_code=400,
+            detail="OPENAI_API_KEY is missing. Add it to transaction-agent/.env to enable natural-language SQL insights.",
+        )
+
+    response = OpenAI().chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": SQL_ANALYST_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        response_format={"type": "json_object"},
+    )
+    content = response.choices[0].message.content or "{}"
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"LLM returned invalid JSON: {exc}") from exc
+
+    sql = payload.get("sql")
+    if not isinstance(sql, str) or not sql.strip():
+        raise HTTPException(status_code=502, detail="LLM did not return a SQL query.")
+
+    payload["sql"] = _validate_read_only_sql(sql)
+    payload["chart_type"] = payload.get("chart_type") if payload.get("chart_type") in {"bar", "line", "table", "metric"} else "table"
+    payload["title"] = payload.get("title") or "Generated insight"
+    payload["explanation"] = payload.get("explanation") or ""
+    payload["x_key"] = payload.get("x_key")
+    payload["y_key"] = payload.get("y_key")
+    return payload
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -101,6 +181,33 @@ def health() -> dict[str, str]:
 def pending_transactions() -> dict[str, Any]:
     transactions = MetabaseTool().get_pending_transactions()
     return {"count": len(transactions), "transactions": transactions}
+
+
+@app.post("/api/query-insights")
+def query_insights(request: InsightQueryRequest) -> dict[str, Any]:
+    generated = _generate_insight_sql(request.prompt, request.model)
+    try:
+        rows = MetabaseTool().query(generated["sql"])
+    except MetabaseQueryError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "Generated SQL was rejected by Metabase.",
+                "error": str(exc),
+                "sql": generated["sql"],
+            },
+        ) from exc
+    return {
+        "prompt": request.prompt,
+        "title": generated["title"],
+        "sql": generated["sql"],
+        "chart_type": generated["chart_type"],
+        "x_key": generated["x_key"],
+        "y_key": generated["y_key"],
+        "explanation": generated["explanation"],
+        "row_count": len(rows),
+        "rows": rows,
+    }
 
 
 @app.post("/api/intelligence")
