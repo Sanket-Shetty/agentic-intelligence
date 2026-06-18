@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Literal
 
+import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,12 +15,31 @@ from openai import OpenAI
 from pydantic import BaseModel, Field
 
 from agent.prompts import SQL_ANALYST_SYSTEM_PROMPT
+from integrations.github import GitHubConfigError, GitHubTool
+from integrations.sentry import SentryConfigError, SentryTool
+from integrations.sentry_triage import summarize_sentry_issue
 from tools.loki import LokiTool
 from tools.metabase import MetabaseQueryError, MetabaseTool
 from tools.mixpanel import MixpanelTool
 from utils.parsers import chain_id_to_name, human_readable_amount, slippage_bps
 
 load_dotenv()
+
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+except ImportError:  # pragma: no cover - optional until requirements are installed
+    sentry_sdk = None
+    FastApiIntegration = None
+
+if sentry_sdk and os.getenv("SENTRY_DSN"):
+    sentry_sdk.init(
+        dsn=os.getenv("SENTRY_DSN"),
+        integrations=[FastApiIntegration()] if FastApiIntegration else [],
+        traces_sample_rate=float(os.getenv("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        environment=os.getenv("APP_ENV", "local"),
+        release=os.getenv("APP_RELEASE"),
+    )
 
 app = FastAPI(title="Transaction Intelligence Agent API")
 app.add_middleware(
@@ -47,6 +67,23 @@ class SourceStatus(BaseModel):
     ok: bool
     error: str | None = None
     found: bool | None = None
+
+
+class SentryIssueListRequest(BaseModel):
+    query: str = "is:unresolved"
+    limit: int = Field(default=10, ge=1, le=50)
+
+
+class SentryTriageRequest(BaseModel):
+    events_limit: int = Field(default=5, ge=1, le=10)
+
+
+class PullRequestRequest(BaseModel):
+    head_branch: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    body: str = Field(min_length=1)
+    base_branch: str | None = None
+    draft: bool = False
 
 
 def _unix_from_created_at(value: Any) -> int | None:
@@ -172,6 +209,21 @@ def _generate_insight_sql(prompt: str, model: str) -> dict[str, Any]:
     return payload
 
 
+def _external_api_detail(exc: requests.exceptions.HTTPError) -> dict[str, Any]:
+    response = exc.response
+    if response is None:
+        return {"message": str(exc)}
+    try:
+        body: Any = response.json()
+    except ValueError:
+        body = response.text
+    return {
+        "message": "External API request failed.",
+        "status_code": response.status_code,
+        "body": body,
+    }
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -208,6 +260,60 @@ def query_insights(request: InsightQueryRequest) -> dict[str, Any]:
         "row_count": len(rows),
         "rows": rows,
     }
+
+
+@app.post("/api/sentry/issues")
+def sentry_issues(request: SentryIssueListRequest) -> dict[str, Any]:
+    try:
+        issues = SentryTool().list_issues(query=request.query, limit=request.limit)
+        return {"count": len(issues), "issues": issues}
+    except SentryConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.exceptions.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=_external_api_detail(exc)) from exc
+
+
+@app.post("/api/sentry/issues/{issue_id}/triage")
+def sentry_issue_triage(issue_id: str, request: SentryTriageRequest) -> dict[str, Any]:
+    try:
+        sentry = SentryTool()
+        issue = sentry.get_issue(issue_id)
+        events = sentry.get_issue_events(issue_id, limit=request.events_limit)
+        triage = summarize_sentry_issue(issue, events)
+        return {"issue": issue, "events": events, "triage": triage}
+    except SentryConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.exceptions.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=_external_api_detail(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/sentry/issues/{issue_id}/resolve")
+def sentry_issue_resolve(issue_id: str) -> dict[str, Any]:
+    try:
+        return {"issue": SentryTool().resolve_issue(issue_id)}
+    except SentryConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.exceptions.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=_external_api_detail(exc)) from exc
+
+
+@app.post("/api/github/pull-request")
+def github_pull_request(request: PullRequestRequest) -> dict[str, Any]:
+    try:
+        pull_request = GitHubTool().create_pull_request(
+            head_branch=request.head_branch,
+            title=request.title,
+            body=request.body,
+            base_branch=request.base_branch,
+            draft=request.draft,
+        )
+        return {"pull_request": pull_request}
+    except GitHubConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.exceptions.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=_external_api_detail(exc)) from exc
 
 
 @app.post("/api/intelligence")

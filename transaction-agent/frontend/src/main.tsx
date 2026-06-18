@@ -1,6 +1,6 @@
 import React from "react"
 import ReactDOM from "react-dom/client"
-import { Activity, AlertTriangle, ArrowRight, BarChart3, Database, Gauge, RefreshCw, Search, Sparkles, Timer } from "lucide-react"
+import { Activity, AlertTriangle, ArrowRight, BarChart3, Bug, Database, Gauge, RefreshCw, Search, Sparkles, Timer } from "lucide-react"
 
 import { Card } from "@/components/ui/card"
 import { SplineScene } from "@/components/ui/splite"
@@ -77,6 +77,33 @@ type InsightResult = {
   rows: Array<Record<string, unknown>>
 }
 
+type SentryIssue = {
+  id: string
+  shortId?: string
+  title?: string
+  culprit?: string
+  count?: string
+  userCount?: number
+  lastSeen?: string
+  permalink?: string
+  level?: string
+  status?: string
+}
+
+type SentryTriage = {
+  confirmed_bug: boolean
+  confidence: number
+  severity: string
+  likely_area: string
+  why: string
+  reproduction_hypothesis: string
+  fix_plan: string[]
+  test_plan: string[]
+  codex_prompt: string
+  pr_title: string
+  pr_body: string
+}
+
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000"
 
 function formatValue(value: unknown) {
@@ -98,6 +125,11 @@ function App() {
   const [insightResult, setInsightResult] = React.useState<InsightResult | null>(null)
   const [insightLoading, setInsightLoading] = React.useState(false)
   const [insightError, setInsightError] = React.useState("")
+  const [sentryIssues, setSentryIssues] = React.useState<SentryIssue[]>([])
+  const [sentryLoading, setSentryLoading] = React.useState(false)
+  const [sentryError, setSentryError] = React.useState("")
+  const [sentryTriage, setSentryTriage] = React.useState<SentryTriage | null>(null)
+  const [selectedSentryIssue, setSelectedSentryIssue] = React.useState<SentryIssue | null>(null)
 
   const loadPendingTransactions = React.useCallback(async () => {
     setPendingLoading(true)
@@ -182,6 +214,53 @@ function App() {
       setInsightError(caught instanceof Error ? caught.message : "Unexpected error")
     } finally {
       setInsightLoading(false)
+    }
+  }
+
+  async function loadSentryIssues() {
+    setSentryLoading(true)
+    setSentryError("")
+    setSentryTriage(null)
+
+    try {
+      const response = await fetch(`${API_URL}/api/sentry/issues`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "is:unresolved", limit: 10 }),
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail ?? "Unable to load Sentry issues")
+      }
+      setSentryIssues(payload.issues ?? [])
+    } catch (caught) {
+      setSentryError(caught instanceof Error ? caught.message : "Unexpected error")
+    } finally {
+      setSentryLoading(false)
+    }
+  }
+
+  async function triageSentryIssue(issue: SentryIssue) {
+    setSelectedSentryIssue(issue)
+    setSentryLoading(true)
+    setSentryError("")
+    setSentryTriage(null)
+
+    try {
+      const response = await fetch(`${API_URL}/api/sentry/issues/${issue.id}/triage`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ events_limit: 5 }),
+      })
+      const payload = await response.json()
+      if (!response.ok) {
+        throw new Error(payload.detail ?? "Unable to triage Sentry issue")
+      }
+      setSentryTriage(payload.triage)
+    } catch (caught) {
+      setSentryError(caught instanceof Error ? caught.message : "Unexpected error")
+    } finally {
+      setSentryLoading(false)
     }
   }
 
@@ -290,6 +369,16 @@ function App() {
           onSubmit={handleInsightSubmit}
           prompt={insightPrompt}
           result={insightResult}
+        />
+
+        <SentryOpsPanel
+          error={sentryError}
+          issues={sentryIssues}
+          loading={sentryLoading}
+          onRefresh={loadSentryIssues}
+          onTriage={triageSentryIssue}
+          selectedIssue={selectedSentryIssue}
+          triage={sentryTriage}
         />
       </section>
     </main>
@@ -540,7 +629,7 @@ function InsightQueryPanel({
           <h2 className="text-xl font-semibold text-white">Ask transaction data</h2>
         </div>
         <p className="mt-1 text-sm text-slate-400">
-          Ask in plain English. The agent writes read-only SQL using successful transaction logic, quoteId joins, and chain names.
+          Ask in plain English. The agent writes read-only SQL against direct route analytics, successful source transactions, and chain names.
         </p>
       </div>
 
@@ -679,6 +768,117 @@ function InsightTable({ rows }: { rows: Array<Record<string, unknown>> }) {
           ))}
         </tbody>
       </table>
+    </div>
+  )
+}
+
+function SentryOpsPanel({
+  error,
+  issues,
+  loading,
+  onRefresh,
+  onTriage,
+  selectedIssue,
+  triage,
+}: {
+  error: string
+  issues: SentryIssue[]
+  loading: boolean
+  onRefresh: () => void
+  onTriage: (issue: SentryIssue) => void
+  selectedIssue: SentryIssue | null
+  triage: SentryTriage | null
+}) {
+  return (
+    <section className="mt-8 rounded-lg border border-white/10 bg-white/[0.04]">
+      <div className="flex flex-col gap-4 border-b border-white/10 p-4 md:flex-row md:items-center md:justify-between">
+        <div>
+          <div className="flex items-center gap-2">
+            <Bug className="h-5 w-5 text-teal-200" />
+            <h2 className="text-xl font-semibold text-white">Sentry auto-triage</h2>
+          </div>
+          <p className="mt-1 text-sm text-slate-400">
+            Pull unresolved issues, confirm whether they look real, and generate a Codex-ready fix brief.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onRefresh}
+          disabled={loading}
+          className="inline-flex h-10 items-center justify-center gap-2 rounded-md border border-white/10 bg-slate-950 px-3 text-sm font-medium text-white transition hover:bg-white/10 disabled:cursor-not-allowed disabled:opacity-60"
+        >
+          <RefreshCw className={loading ? "h-4 w-4 animate-spin" : "h-4 w-4"} />
+          Load issues
+        </button>
+      </div>
+
+      {error && (
+        <div className="m-4 flex items-start gap-3 rounded-md border border-red-400/30 bg-red-500/10 p-3 text-sm text-red-100">
+          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+          <span>{error}</span>
+        </div>
+      )}
+
+      <div className="grid gap-4 p-4 lg:grid-cols-[1fr_1fr]">
+        <div className="space-y-3">
+          {issues.length === 0 && !loading && <div className="rounded-md bg-black/20 p-4 text-sm text-slate-400">No Sentry issues loaded.</div>}
+          {issues.map((issue) => (
+            <button
+              key={issue.id}
+              type="button"
+              onClick={() => onTriage(issue)}
+              className="block w-full rounded-md border border-white/10 bg-slate-950/70 p-3 text-left transition hover:border-teal-300/60"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-white">{issue.shortId ?? issue.id}</div>
+                  <div className="mt-1 text-sm text-slate-300">{issue.title ?? "Untitled issue"}</div>
+                </div>
+                <div className="rounded bg-white/10 px-2 py-1 text-xs text-slate-300">{issue.count ?? 0} events</div>
+              </div>
+              <div className="mt-2 text-xs text-slate-500">{issue.culprit ?? issue.lastSeen ?? "No culprit"}</div>
+            </button>
+          ))}
+        </div>
+
+        <div className="rounded-md border border-white/10 bg-slate-950/70 p-4">
+          {!triage && (
+            <div className="text-sm text-slate-400">
+              {selectedIssue ? "Triage is running..." : "Select an issue to generate the AI triage brief."}
+            </div>
+          )}
+          {triage && (
+            <div className="space-y-4">
+              <div>
+                <div className={triage.confirmed_bug ? "text-sm font-semibold text-amber-200" : "text-sm font-semibold text-slate-300"}>
+                  {triage.confirmed_bug ? "Confirmed likely bug" : "Not confirmed"}
+                </div>
+                <h3 className="mt-1 text-lg font-semibold text-white">{triage.likely_area || "Unknown area"}</h3>
+                <p className="mt-2 text-sm leading-6 text-slate-300">{triage.why}</p>
+              </div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <TriageList title="Fix plan" items={triage.fix_plan} />
+                <TriageList title="Test plan" items={triage.test_plan} />
+              </div>
+              <DataBlock title="Codex prompt" data={triage.codex_prompt} />
+              <DataBlock title="PR title/body" data={{ title: triage.pr_title, body: triage.pr_body }} />
+            </div>
+          )}
+        </div>
+      </div>
+    </section>
+  )
+}
+
+function TriageList({ title, items }: { title: string; items: string[] }) {
+  return (
+    <div>
+      <h4 className="text-sm font-semibold text-white">{title}</h4>
+      <ul className="mt-2 space-y-2 text-sm text-slate-300">
+        {(items.length ? items : ["No steps returned."]).map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>
     </div>
   )
 }

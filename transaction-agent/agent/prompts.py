@@ -33,33 +33,22 @@ Generate a single read-only PostgreSQL query for Metabase. Return only JSON with
 }
 
 Critical schema and join rules:
-- Main table: public.bungee_request a
-- Quote table: public.quote_response b
-- Always join quotes as: LEFT JOIN public.quote_response b ON a."quoteId" = b."quoteId"
-- Important request columns:
-  a."requestHash", a."requestType", a."routerType", a."inputToken", a."inputAmount",
-  a."originChainId", a."destinationChainId", a."failureReason", a."outputToken",
-  a."winnerPromisedAmount", a."swapTxHash", a."inboxCreatedTxHash",
-  a."extractionTxHash", a."fulfilmentTxHash", a."cancelledTxHash",
-  a."inboxWithdrawnTxHash", a."requestReceivedAt", a."auctionStartedAt",
-  a."firstBidReceivedAt", a."auctionEndedAt", a."extractionTimestamp",
-  a."inboxRequestCreatedTimestamp", a."createdAt", a."withdrawOnSourceTxHash",
-  a."withdrawOnDestinationTxHash", a."quoteId"
-- Important quote columns:
-  b."integratorName", b."inputTokenSymbol", b."inputAmountInUSD",
-  b."outputTokenSymbol", b."outputAmountInUSD", b."slippage",
-  b."suggestedClientSlippage"
+- Main table: public.direct_route_analytics a
+- Do not use public.bungee_request or public.quote_response for natural-language analytics.
+- Do not join quote tables for natural-language analytics. All required quote, route, token, user, and volume fields are on direct_route_analytics.
+- Important columns:
+  a."recordId", a."quoteId", a."quoteType", a."dexName", a."bridgeName",
+  a."srcTxHash", a."destTxHash", a."quoteCreatedAt", a."originChainId",
+  a."destinationChainId", a."inputToken", a."inputAmount", a."inputTokenSymbol",
+  a."outputToken", a."outputTokenSymbol", a."outputTokenDecimals",
+  a."userAddress", a."receiverAddress", a."outputAmount", a."minOutputAmount",
+  a."outputPriceInUsd", a."outputValueInUsd", a."outputEffectiveValueInUsd",
+  a."outputEffectiveReceivedInUsd", a."gasTokenSymbol", a."gasTokenChainId",
+  a."routeName", a."routeDexId", a."feeTakerAddress", a."feeUsd",
+  a."feeTakerToken", a."integratorId", a."noQuotes", a."eventReceivedAt"
 
 Use this exact successful transaction filter whenever the prompt asks about successful, completed, volume, count, routes, chains, integrators, or normal transaction analytics unless the user explicitly asks for pending/failed/cancelled:
-AND (
-  (a."swapTxHash" IS NOT NULL AND a."inboxCreatedTxHash" IS NULL AND a."originChainId" = a."destinationChainId" AND a."requestType" = 'SWAP_REQUEST')
-  OR
-  (a."extractionTxHash" IS NOT NULL AND a."fulfilmentTxHash" IS NOT NULL AND a."swapTxHash" IS NULL AND a."inboxCreatedTxHash" IS NULL AND a."requestType" = 'SINGLE_OUTPUT_REQUEST')
-  OR
-  (a."swapTxHash" IS NOT NULL AND a."inboxCreatedTxHash" IS NOT NULL AND a."originChainId" = a."destinationChainId" AND a."requestType" = 'SWAP_REQUEST')
-  OR
-  (a."extractionTxHash" IS NOT NULL AND a."fulfilmentTxHash" IS NOT NULL AND a."swapTxHash" IS NULL AND a."inboxCreatedTxHash" IS NOT NULL AND a."requestType" = 'SINGLE_OUTPUT_REQUEST')
-)
+AND a."srcTxHash" IS NOT NULL
 
 Use this chain_mapping CTE whenever chain names are needed:
 WITH chain_mapping AS (
@@ -68,23 +57,27 @@ WITH chain_mapping AS (
     (137, 'Polygon'), (130, 'Unichain'), (143, 'Monad'), (480, 'World Chain'),
     (999, 'HyperEVM'), (1868, 'Soneium'), (4217, 'Tempo'), (5000, 'Mantle'),
     (8453, 'Base'), (43114, 'Avalanche'), (57073, 'Ink'), (59144, 'Linea'),
-    (728126428, 'Tron'), (89999, 'Berachain bArtio'), (98866, 'Custom Chain'),
-    (42161, 'Arbitrum'), (1337, 'Geth Testnet / Local Dev'), (146, 'Sonic Mainnet'),
-    (34443, 'BSquared Network'), (9745, 'Plasma Mainnet'), (534352, 'Scroll'),
-    (5064014, 'Ethereal')
+    (728126428, 'Tron'), (89999, 'Solana'), (98866, 'Plume'),
+    (42161, 'Arbitrum'), (1337, 'Hyperliquid'), (146, 'Sonic'),
+    (34443, 'Mode'), (9745, 'Plasma'), (534352, 'Scroll'),
+    (4326, 'MegaETH'), (324, 'ZKsync Era'), (1329, 'Sei'),
+    (2741, 'Abstract'), (1101, 'Polygon zkEVM'), (81457, 'Blast'),
+    (747474, 'Katana')
   ) AS t(chain_id, chain_name)
 )
 Join origin chain as: LEFT JOIN chain_mapping c ON a."originChainId" = c.chain_id
 Join destination chain as: LEFT JOIN chain_mapping d ON a."destinationChainId" = d.chain_id
 
 Time rules:
-- If the user says "last N days", filter a."createdAt" >= NOW() - INTERVAL 'N days'.
+- If the user says "last N days", filter a."quoteCreatedAt" >= NOW() - INTERVAL 'N days'.
 - If no time range is specified, default to last 7 days.
 
 Metric rules:
-- b."inputAmountInUSD" is numeric. For source/input volume, use SUM(COALESCE(b."inputAmountInUSD", 0)).
-- b."outputAmountInUSD" may be text. For received/output volume, use SUM(COALESCE(NULLIF(b."outputAmountInUSD", '')::numeric, 0)).
-- Transaction count should use COUNT(DISTINCT a."requestHash").
+- For volume, use SUM(COALESCE(a."outputEffectiveReceivedInUsd", 0)).
+- Transaction count should use COUNT(DISTINCT a."srcTxHash").
+- User count should use COUNT(DISTINCT a."userAddress").
+- Route/provider should use COALESCE(a."bridgeName", a."dexName", a."routeName", a."routeDexId").
+- Same-chain/cross-chain classification should use CASE WHEN a."originChainId" = a."destinationChainId" THEN 'Same Chain' WHEN a."originChainId" <> a."destinationChainId" THEN 'Cross Chain' ELSE 'Unknown' END.
 - Use chain names, not IDs, when the user names a chain.
 
 Safety rules:
